@@ -8,6 +8,14 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.database.sqlite.SQLiteConstraintException
 import android.os.Bundle
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import java.io.File
+import java.security.KeyStore
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import java.text.DateFormat
+import java.util.Date
 import android.text.InputType
 import android.view.View
 import android.widget.*
@@ -88,6 +96,9 @@ class MainActivity : Activity() {
     private val createBackup = 41
     private val openBackup = 42
     private var pendingPassword = ""
+    private val autoBackupFolder by lazy { File(filesDir, "copias_automaticas") }
+    private val backupKeyAlias = "legajos_auto_backup_v1"
+    private val backupIntervalMs = 24L * 60L * 60L * 1000L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -182,12 +193,15 @@ class MainActivity : Activity() {
         root.addView(text(title,25f)); root.addView(text("Registro local · Sin conexión a internet",13f))
     }
     private fun showHome() {
+        createDailyBackupIfDue()
         base("Legajos de Pacientes")
         search = field("Buscar paciente, DNI, legajo u otra parte")
         root.addView(search)
         root.addView(button("Buscar") { renderResults() })
         root.addView(button("+ Registrar legajo") { showEditor(null) })
         root.addView(button("Configurar clave de recuperación") { activateRecovery() })
+        root.addView(button("Ver copias automáticas") { showAutomaticBackups() })
+        root.addView(text("Las copias automáticas se generan al abrir la aplicación si pasó un día. Se conservan las últimas 10 en este teléfono.",12f))
         root.addView(button("Crear copia cifrada") { askBackupPassword(true) })
         root.addView(button("Restaurar copia cifrada") { askBackupPassword(false) })
         root.addView(text("La restauración reemplaza todos los registros actuales. Guardá las copias en un lugar seguro.",12f))
@@ -275,6 +289,99 @@ class MainActivity : Activity() {
             }
         } catch (_: Exception) { toast("No se pudo procesar la copia. Revisá el archivo y la contraseña.") }
     }
+
+    // Copias internas cifradas con una clave AES guardada en Android Keystore.
+    // No se pueden restaurar en otro teléfono; para eso usar "Crear copia cifrada".
+    private fun automaticBackupKey(): SecretKey {
+        val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val existing = store.getKey(backupKeyAlias, null)
+        if (existing is SecretKey) return existing
+        val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        generator.init(
+            KeyGenParameterSpec.Builder(backupKeyAlias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setRandomizedEncryptionRequired(true)
+                .build()
+        )
+        return generator.generateKey()
+    }
+
+    private fun encryptAutomatic(raw: ByteArray): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, automaticBackupKey())
+        return "LGA1".toByteArray(Charsets.US_ASCII) + cipher.iv + cipher.doFinal(raw)
+    }
+
+    private fun decryptAutomatic(bytes: ByteArray): String {
+        if (bytes.size < 33 || !bytes.copyOfRange(0,4).contentEquals("LGA1".toByteArray(Charsets.US_ASCII))) {
+            throw IllegalArgumentException("Formato de copia incorrecto")
+        }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, automaticBackupKey(), GCMParameterSpec(128, bytes.copyOfRange(4,16)))
+        return cipher.doFinal(bytes.copyOfRange(16,bytes.size)).toString(Charsets.UTF_8)
+    }
+
+    private fun automaticBackups(): List<File> =
+        (autoBackupFolder.listFiles()?.filter { it.isFile && it.name.endsWith(".lga") } ?: emptyList())
+            .sortedByDescending { it.lastModified() }
+
+    private fun createDailyBackupIfDue() {
+        try {
+            val newest = automaticBackups().firstOrNull()
+            if (newest != null && System.currentTimeMillis() - newest.lastModified() < backupIntervalMs) return
+            if (!autoBackupFolder.exists() && !autoBackupFolder.mkdirs()) throw IllegalStateException("No se pudo crear la carpeta")
+            val now = System.currentTimeMillis()
+            val output = File(autoBackupFolder, "copia-$now.lga")
+            val encrypted = encryptAutomatic(db.json().toByteArray(Charsets.UTF_8))
+            val temp = File(autoBackupFolder, "copia-$now.tmp")
+            try {
+                temp.outputStream().use { stream -> stream.write(encrypted); stream.fdSyncIfPossible() }
+                if (!temp.renameTo(output)) throw IllegalStateException("No se pudo guardar la copia")
+            } finally { if (temp.exists()) temp.delete() }
+            automaticBackups().drop(10).forEach { it.delete() }
+        } catch (_: Exception) {
+            toast("No se pudo crear la copia automática. Revisá el almacenamiento.")
+        }
+    }
+
+    // En Kotlin no hay un fsync directo sobre OutputStream; FileOutputStream permite sincronizar.
+    private fun java.io.OutputStream.fdSyncIfPossible() {
+        if (this is java.io.FileOutputStream) fd.sync()
+    }
+
+    private fun showAutomaticBackups() {
+        val backups = automaticBackups()
+        if (backups.isEmpty()) {
+            AlertDialog.Builder(this).setTitle("Copias automáticas")
+                .setMessage("Todavía no hay copias automáticas disponibles.")
+                .setPositiveButton("Aceptar",null).show()
+            return
+        }
+        val labels = backups.map { file ->
+            DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(file.lastModified()))
+        }.toTypedArray()
+        AlertDialog.Builder(this).setTitle("Copias automáticas (últimas ${backups.size})")
+            .setItems(labels) { _, which -> confirmAutomaticRestore(backups[which]) }
+            .setNegativeButton("Cerrar",null).show()
+    }
+
+    private fun confirmAutomaticRestore(file: File) {
+        AlertDialog.Builder(this).setTitle("Restaurar copia automática")
+            .setMessage("Esta acción reemplazará todos los legajos actuales por los de la copia seleccionada. ¿Querés continuar?")
+            .setNegativeButton("Cancelar",null)
+            .setPositiveButton("Restaurar") { _, _ ->
+                try {
+                    val raw = decryptAutomatic(file.readBytes())
+                    val count = db.replaceFromJson(raw)
+                    toast("Legajos restaurados: $count")
+                    showHome()
+                } catch (_: Exception) {
+                    toast("No se pudo restaurar esta copia")
+                }
+            }.show()
+    }
+
     private fun encrypt(plain: ByteArray, password: String): ByteArray {
         val salt=ByteArray(16); val iv=ByteArray(12); SecureRandom().nextBytes(salt); SecureRandom().nextBytes(iv)
         val cipher=Cipher.getInstance("AES/GCM/NoPadding"); cipher.init(Cipher.ENCRYPT_MODE,derive(password,salt),GCMParameterSpec(128,iv))
